@@ -54,6 +54,7 @@ import gzip
 import sys
 import operator
 
+import collections
 from collections import defaultdict
 from itertools import izip
 from tempfile import mkstemp
@@ -63,6 +64,8 @@ def deprecated(message):
     """Prints a warning message related to the deprecation of some igraph
     feature."""
     warn(message, DeprecationWarning, stacklevel=3)
+
+
 
 # pylint: disable-msg=E1101
 class Graph(GraphBase):
@@ -345,6 +348,10 @@ class Graph(GraphBase):
                 not isinstance(args[0], EdgeSeq)):
             edge_seq = self.es(*args, **kwds)
         else:
+            print "WENT INTO ELSE"
+            print args
+            print "|||"
+            print args[0]
             edge_seq = args[0]
         return GraphBase.delete_edges(self, edge_seq)
 
@@ -2987,8 +2994,8 @@ class Graph(GraphBase):
           "graphmlz":   ("Read_GraphMLz", "write_graphmlz"),
           "graphml":    ("Read_GraphML", "write_graphml"),
           "gml":        ("Read_GML", "write_gml"),
-          "dot":		(None, "write_dot"),
-          "graphviz":	(None, "write_dot"),
+          "dot":        (None, "write_dot"),
+          "graphviz":   (None, "write_dot"),
           "net":        ("Read_Pajek", "write_pajek"),
           "pajek":      ("Read_Pajek", "write_pajek"),
           "dimacs":     ("Read_DIMACS", "write_dimacs"),
@@ -3040,6 +3047,348 @@ class Graph(GraphBase):
     # of Graph.layout if necessary!
 
 ##############################################################
+
+class AutoDecrementDict:
+    """Auto decrementing dictionary data structure
+
+    When a key 'k' is removed, all entries with key > k are decremented by 1 
+    """
+
+    def __init__(self, data=None):
+        """Initializes internal _data storage dictionary.
+
+        Args:
+          data (dict, optional): Dictionary with integer keys & values of any type
+        """
+        self._data = dict()
+        if not (data is None):   
+            self.add(data)
+
+    def add(self, data):
+        """Update internal _data with supplied data parameter
+        
+        Args:
+          data (dict): Dictionary with integer keys & values of any type
+        """
+        self._data.update(data)
+
+    def remove(self, data):
+        """Calls remove_key on all keys supplied by user from internal _data dict
+        
+        Args:
+          data (any iterable): List/tuple of keys to be removed
+        """
+        if isinstance(data, collections.Iterable):
+            for key in data:
+                self.remove_key(key)
+        else:
+            self.remove_key(data)
+
+    def remove_key(self, key):
+        """Removes key from supplied parameter and does auto-decrement operation
+        
+        Args:
+          key (int): Integer key to be removed.
+        """
+        del self._data[key]
+        self.decrement(key)
+        
+    def decrement(self, key):
+        """Does auto-decrement operation on all k>key
+        
+        Args:
+          key (int)
+        """
+        for k in self._data:
+            if k>key:
+                self._data[k-1] = self._data.pop(k)
+
+    def pop(self, key):
+        """
+        Args:
+          key (int): Key to be passed to remove_key
+
+        Returns:
+          val : Value of removed key
+        """
+        val = self._data[key]
+        self.remove_key(key)
+        return val
+
+    def keys(self):
+        return self._data.keys()
+
+    def __repr__(self):
+        return str(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        self._data[key] = value
+
+class LayerStructure:
+    """Bi-directional layer-edge & edge-layer manager mapping
+
+    Attributes:
+      layers_to_edges (dict): String keys (layer names), and AutoDecrementDict values
+                              AutoDecrementDict has keys as edge IDs, values as weights
+      edges_to_layers (AutoDecrementDict): AutoDecrementDict with Edge IDs as keys
+                                           and list of string layer names as values
+
+    """
+
+    def __init__(self):
+        """Initializes Bi-directional mapping attributes
+        """
+        self.layers_to_edges = dict()
+        self.edges_to_layers = AutoDecrementDict()
+
+    def add_layer(self, name, layerinfo):
+        """Adds a layer called `name` with information `layerinfo`
+        
+        Args:
+          name (string): Layer name
+          layerinfo (AutoDecrementDict): Keys - Edge IDs, Values - Weights
+
+        Raises:
+          TypeError: If layerinfo isn't AutoDecrementDict
+        """
+        if isinstance(layerinfo, AutoDecrementDict):
+            self.layers_to_edges[name] = layerinfo
+            for edge in layerinfo:
+                if edge not in self.edges_to_layers:
+                    self.edges_to_layers[edge] = []
+                self.edges_to_layers[edge].append(name)
+
+        else:
+            raise TypeError("Argument 2 must be of the type AutoDecrementDict")
+
+    def remove_layer(self, name):
+        """Removes layer called `name` from the Bi-directional mappings
+        
+        Args:
+          name (string)
+        """
+
+        #Remove the layer key itself from layers_to_edges
+        layerinfo = self.layers_to_edges.pop(name)
+
+        #Remove layer name from edges_to_layers of relevant edges
+        for edge in layerinfo:
+            self.edges_to_layers[edge].remove(name)
+            if not self.edges_to_layers[edge]: # Delete if not empty
+                del self.edges_to_layers[edge]
+
+    def delete_edge_info(self, eid, max_eid):
+        """Deletes all information about `eid` from Bi-directional mapping
+        
+        We first form a set of layers greater than eid (layers_gtr_than_eid)
+        Then we iterate from `eid+1` to `max_eid`, to find all layers involved in these edge IDs
+            and updated layers_gtr_than_eid accordingly.
+        We pop the `eid` off the forward mapping (edges_to_layers), which gives us the involved
+            layers in layers_of_eid
+        We remove any overlapping layers (between layers_gtr_than_eid and layers_of_eid) and do a 
+            decrement operation on the AutoDecrementDict corresponding to the back-mapping (layers_to_edges)
+            of the layers
+        Finally, we remove_key our eid from all layers_of_eid
+
+        Args:
+          eid (int) : Edge ID to be removed
+          max_eid (int) : Maximum edge ID available in graph. This is required because
+                          all info of Edge IDs > eid must be updated  
+
+
+        """
+        
+        layers_gtr_than_eid = set()
+
+        #Layers to only decrement
+        for e in range(eid+1, max_eid):
+            layers_gtr_than_eid.update(self.edges_to_layers[e])
+        #Layers to remove AND decrement (via remove_key)
+        layers_of_eid = self.edges_to_layers.pop(eid)
+
+        layers_of_eid = set(layers_of_eid)
+        
+        #Decrement all EdgeIDs > eid in all layers which have id>eid
+        for layer in (layers_gtr_than_eid - layers_of_eid):
+            self.layers_to_edges[layer].decrement(eid)
+
+        #Remove edge from all layers_of_eid (auto decrement) 
+        for layer in layers_of_eid:
+            self.layers_to_edges[layer].remove_key(eid)
+        
+    def get_layer_edges(self, layer_name):
+        return self.layers_to_edges[layer_name].keys()
+
+    def __repr__(self):
+        return str(self.layers_to_edges)
+
+class LayeredGraph(Graph):
+    """Subgraph of Graph with Layer management features.
+    delete_edges has been overridden to include automatic Layer Management features.
+
+    Attributes:
+      layer_structure (LayerStructure): A LayerStructure object containing all Information
+                                        regarding layers of the LayeredGraph
+
+    """
+
+    def __init__(self, *args,**kwds):
+        self.layer_structure = LayerStructure()
+        Graph.__init__(self, *args,**kwds)
+
+    def check_edge(self, eid):
+        '''
+        Returns false if eid is more than total number of edges.
+        '''
+        if eid < len(self.es):
+            return True
+        else:
+            raise ValueError("EdgeID %d does not exist"%eid)
+            return False
+
+
+    def add_layer(self, layer_name, layer_data):
+        '''
+        We convert layer_data to an ADD with keys,value = edge,weight
+        This ADD (layer_to_be_added) is passed to layer_structure's add_layer function
+        '''
+        layer_to_be_added = AutoDecrementDict()
+
+        #If layer data is list of Edge IDs or List of pairs of Vertex IDs
+        if isinstance(layer_data, (list, tuple)):
+
+            if all(isinstance(elem, (int, long)) for elem in layer_data):
+                eid_list = layer_data
+
+            elif all(isinstance(elem, (tuple, list)) and len(elem)==2 for elem in layer_data):
+                eid_list=[]
+                for val in layer_data:
+                    try:
+                        edge_id = self.get_eid(val[0], val[1])
+                    except InternalError:
+                        # print "Adding edge" + str(val)
+                        self.add_edge(val[0],val[1])
+                        edge_id = self.get_eid(val[0], val[1])
+                    eid_list.append(edge_id)
+
+            else:
+                raise ValueError("Malformed data. Expected list of integer Edge IDs or list of pairs of vertex IDs or Dict of EdgeID:Weight mappings")
+
+            for eid in eid_list:
+                if self.check_edge(eid):
+                    layer_to_be_added[eid] = 1 #Defualt weight
+
+        #If layer_data is a dict
+        elif isinstance(layer_data, dict):
+            if all(self.check_edge(eid) for eid in layer_data):
+                layer_to_be_added.add(layer_data)
+        
+        else:
+            raise ValueError("Malformed data. Expected list of integer Edge IDs or list of pairs of vertex IDs or Dict of EdgeID:Weight mappings")
+
+        self.layer_structure.add_layer(layer_name, layer_to_be_added)
+
+        #pass ADD {edge:weight, e2,w2} to layer_structure add_layer
+
+    def remove_layer(self, layer_name):
+        self.layer_structure.remove_layer(layer_name)
+
+    def delete_edges(self, *args, **kwds):
+        """Deletes some edges from the graph.
+
+        The set of edges to be deleted is determined by the positional and
+        keyword arguments. If any keyword argument is present, or the
+        first positional argument is callable, an edge
+        sequence is derived by calling L{EdgeSeq.select} with the same
+        positional and keyword arguments. Edges in the derived edge sequence
+        will be removed. Otherwise the first positional argument is considered
+        as follows:
+
+          - C{None} - deletes all edges
+          - a single integer - deletes the edge with the given ID
+          - a list of integers - deletes the edges denoted by the given IDs
+          - a list of 2-tuples - deletes the edges denoted by the given
+            source-target vertex pairs. When multiple edges are present
+            between a given source-target vertex pair, only one is removed.
+
+        After this is completed, we manage our Bi-directional LayerStructure object.
+
+        Raises:
+          ValueError: If supplied list is malformed
+        """
+        if len(args) == 0 and len(kwds) == 0:
+            raise ValueError("expected at least one argument")
+
+        if len(kwds)>0 or (hasattr(args[0], "__call__") and \
+                not isinstance(args[0], EdgeSeq)):
+            edge_seq = self.es(*args, **kwds)
+        
+        else:
+            edge_seq = args[0]
+
+        #Managing layer_structure for current LayeredGraph
+
+        #if args[0] is an integer
+        if isinstance( args[0], ( int, long ) ):
+            self.layer_structure.delete_edge_info(args[0], len(self.es))
+
+        #if args[0] is a list of integers OR list of tuples
+        elif isinstance(args[0], (list, tuple)):
+            if all(isinstance(elem, (int, long)) for elem in args[0]):
+                for eid in args[0]:
+                    self.layer_structure.delete_edge_info(eid, len(self.es))
+
+            elif all(isinstance(elem, (tuple, list)) and len(elem)==2 for elem in args[0]):
+                eid_list = self.get_eids(pairs=args[0])
+                for eid in eid_list:
+                    self.layer_structure.delete_edge_info(eid, len(self.es))
+
+            else:
+                raise ValueError("Malformed List. Expected list of integer Edge IDs or list of pairs of vertex IDs or single integer Edge ID")
+
+        else:
+            raise ValueError("Malformed List. Expected list of integer Edge IDs or list of pairs of vertex IDs or single integer Edge ID")
+
+        res = GraphBase.delete_edges(self, edge_seq)
+        return res
+
+    def get_layers(self, *args):
+        layers_edges = set()
+        for layer in args:
+            edges = self.layer_structure.get_layer_edges(layer)
+            layers_edges.update(edges)
+
+        new_graph = self.subgraph_edges(layers_edges)
+        return new_graph
+
+    def view_layers(self, *args, **kwds):
+        '''Views specified layer'''
+        visual_style = kwds.get('visual_style', {})
+        
+
+        layer_edgelist = [1]*len(self.es)
+
+        layers_edges = set()
+        for layer in args:
+            edges = self.layer_structure.get_layer_edges(layer)
+            layers_edges.update(edges)
+
+        for edge in layers_edges:
+            layer_edgelist[edge]=4
+
+        color_dict = {1:"blue", 4:"red"}
+        visual_style["edge_width"] = layer_edgelist
+        # print layer_edgelist
+        # print [color_dict[x] for x in layer_edgelist]
+        visual_style["edge_color"] = [color_dict[x] for x in layer_edgelist]
+        plot(self, **visual_style)
+
 
 class VertexSeq(_igraph.VertexSeq):
     """Class representing a sequence of vertices in the graph.
